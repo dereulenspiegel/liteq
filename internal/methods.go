@@ -3,6 +3,7 @@ package internal
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -13,7 +14,7 @@ import (
 
 type QueueJobParams struct {
 	Queue             string
-	Job               string
+	Job               []byte
 	ExecuteAfter      int64
 	RemainingAttempts int64
 	DedupingKey       DedupingKey
@@ -139,14 +140,22 @@ func (q *Queries) Consume(ctx context.Context, params ConsumeParams) error {
 		}
 
 		for _, job := range jobs {
-			job := job
 			workers.Submit(func() {
 				err := params.Worker(ctx, job)
 				if err != nil {
-					q.FailJob(ctx, FailJobParams{
-						ID:     job.ID,
-						Errors: ErrorList(append(job.Errors, err.Error())),
-					})
+					failJobParams := FailJobParams{
+						ID:                job.ID,
+						Errors:            ErrorList(append(job.Errors, err.Error())),
+						RemainingAttempts: job.RemainingAttempts - 1,
+					}
+					workerErr := &WorkerError{}
+					if errors.As(err, &workerErr) {
+						failJobParams.ExecuteAfter = time.Now().Add(workerErr.DelayRetry).Unix()
+						if workerErr.RemainingAttempts != nil {
+							failJobParams.RemainingAttempts = int64(*workerErr.RemainingAttempts)
+						}
+					}
+					q.FailJob(ctx, failJobParams)
 					return
 				}
 
